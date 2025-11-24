@@ -1,0 +1,99 @@
+/* analyzer.c (최종 완성본 - 헤더 검사 포함) */
+#include "entropy.h"
+#include "analyzer.h"
+#include <string.h> // strcmp, memcmp
+#include <stddef.h> // size_t, NULL
+#include <stdio.h> 
+
+// 1. 내용 기반 가중치
+#define WEIGHT_WRITE 1
+#define WEIGHT_HIGH_ENTROPY 20
+#define ENTROPY_THRESHOLD 4.2
+
+// 2. 행위 기반 가중치
+#define WEIGHT_MALICIOUS 10 
+#define WEIGHT_MALICIOUS_LOW 2 
+
+// 3. 맥락 기반 가중치
+#define WEIGHT_LARGE_WRITE 150
+#define LARGE_WRITE_THRESHOLD (10* 1024 * 1024)
+
+// 4. 변화량/헤더 기반 가중치 (즉시 차단)
+#define WEIGHT_RANSOMWARE_DETECTED 150 
+#define HIGH_ENTROPY_FLOOR 6.0 // 이 값 이상이면 암호화 의심
+
+
+/**
+ * @brief 데이터 헤더(Magic Number)를 검사하여 알려진 파일 형식인지 확인
+ * (JPG, PNG, ZIP/Office, PDF, MP4, MP3 등)
+ */
+int is_valid_file_header(const char *buf, size_t size) {
+    if (size < 4) return 0; 
+
+    // JPG (FF D8 FF)
+    if (size >= 3 && memcmp(buf, "\xFF\xD8\xFF", 3) == 0) return 1;
+    // PNG (89 50 4E 47)
+    if (size >= 4 && memcmp(buf, "\x89\x50\x4E\x47", 4) == 0) return 1;
+    // ZIP, Office (PK..) .docx (워드), .xlsx (엑셀), .pptx (파워포인트), .apk, .jar 파일들이 전부 보호( 이 파일들은 내부적으로 ZIP 포맷이라서 전부 PK로 시작)
+    if (size >= 2 && memcmp(buf, "PK", 2) == 0) return 1;
+    // PDF (%PDF)
+    if (size >= 4 && memcmp(buf, "%PDF", 4) == 0) return 1;
+    // MP4 (ftyp)
+    if (size >= 12 && memcmp(buf + 4, "ftyp", 4) == 0) return 1;
+    // MP3 (ID3)
+    if (size >= 3 && memcmp(buf, "ID3", 3) == 0) return 1;
+
+    return 0; // 알려진 헤더가 아님
+}
+
+
+int get_score(const char* operation, const char* new_buf, const char* old_buf_or_null, size_t size) {
+    int score_to_add = 0;
+
+    if (strcmp(operation, "WRITE") == 0) {
+        score_to_add += WEIGHT_WRITE;
+
+        // [최종 방어 로직: 고엔트로피 & 헤더 검사]
+        if (new_buf != NULL && size > 0) {
+            
+            double new_entropy = calculate_entropy(new_buf, size);
+            
+            // 1. "지금 쓰려는 데이터"가 암호화 수준(6.0 이상)으로 복잡한가?
+            if (new_entropy > HIGH_ENTROPY_FLOOR) {
+                
+                // 2. 그렇다면, 정상적인 파일 헤더(신분증)가 있는가?
+                if (is_valid_file_header(new_buf, size)) {
+                    // [PASS] "엔트로피는 높지만, JPG/ZIP 신분증이 있으니 정상 파일이다."
+                    // (점수 추가 없음 -> 1점 통과)
+                } 
+                else {
+                    // [BLOCK] "엔트로피가 높은데 신분증도 없다? 이건 100% 랜섬웨어다!"
+                    // (JPG 덮어쓰기 공격도 여기서 걸림)
+                    score_to_add += WEIGHT_RANSOMWARE_DETECTED; // 150점 (즉시 차단)
+                }
+            }
+        }
+        
+        // [방어 2: 대용량 쓰기]
+        if (size > LARGE_WRITE_THRESHOLD) {
+            score_to_add += WEIGHT_LARGE_WRITE; // 150점 (즉시 차단)
+        }
+
+    } else if (strcmp(operation, "UNLINK") == 0 || strcmp(operation, "RENAME") == 0) {
+        score_to_add += WEIGHT_MALICIOUS;
+
+    } else if (strcmp(operation, "READ") == 0 ||
+               strcmp(operation, "OPEN") == 0 ||
+               strcmp(operation, "GETATTR") == 0 ||
+               strcmp(operation, "READDIR") == 0) {
+        score_to_add += WEIGHT_MALICIOUS_LOW;
+    
+    } else if (strcmp(operation, "CREATE") == 0 ||
+               strcmp(operation, "MKDIR") == 0 ||
+               strcmp(operation, "RMDIR") == 0 ||
+               strcmp(operation, "UTIMENS") == 0) {
+        score_to_add += WEIGHT_MALICIOUS_LOW;
+    }
+
+    return score_to_add;
+}
